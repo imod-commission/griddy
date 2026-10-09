@@ -1,6 +1,15 @@
 #import "Headers.h"
 #import "Utils.h"
 #import "GriddyIconLocationPreferences.h"
+#import <objc/message.h>
+
+// FIX (compile error): SBIcon's private selector `iconImageWithInfo:` is not declared
+// in public headers, so the compiler complains. Declaring it in a local category both
+// silences the error and lets us call it normally (no objc_msgSend gymnastics needed,
+// which is important because the argument is a struct, not an object).
+@interface SBIcon (GriddyPrivate)
+- (UIImage *)iconImageWithInfo:(SBIconImageInfo)info;
+@end
 
 NSMutableDictionary<NSString *, GriddyIconLocationPreferences *> *locationPrefs;
 NSDictionary<NSString *, NSNumber *> *portraitSavedDict;
@@ -19,12 +28,56 @@ NSUserDefaults *userDefaults;
 CGRect gridWrapperSize;
 BOOL shouldPatchFolderIcon = YES;
 BOOL patchFoldersChecked = NO;
-NSMutableDictionary<NSString *, SBIconGridImage *> *folderImageCache;
+// FIX (bug 1): cache now stores a dict {image, signature} keyed by folder uniqueIdentifier
+NSMutableDictionary<NSString *, NSDictionary *> *folderImageCache;
 BOOL griddyImageSuccess = NO;
 BOOL hasLoadedPrefs = NO;
 
+// FIX (bug 1): signature now uses per-icon IMAGE FINGERPRINTS (CGImage pointers) instead of
+// a global theme version. This makes the folder preview cache invalidate whenever the actual
+// icon images change, regardless of who produced the change (system, theme tweak like 26Home,
+// icon pack, etc). Works even if the theme tweak uses a private cache and never clears the
+// standard system icon image caches.
+static NSString *GriddyFolderSignature(SBIconListModel *model, SBIconListGridLayout *layout) {
+    if (!model) return @"";
+    NSMutableString *sig = [NSMutableString string];
+
+    NSArray *icons = model.icons ?: @[];
+    NSUInteger count = icons.count;
+    [sig appendFormat:@"n%lu|", (unsigned long)count];
+
+    NSUInteger previewCount = count < 9 ? count : 9;
+    for (NSUInteger i = 0; i < previewCount; i++) {
+        SBIcon *icon = icons[i];
+        [sig appendFormat:@"%@|", icon.uniqueIdentifier ?: @"?"];
+
+        // Pull the current rendered image for this icon and use its CGImage pointer as the
+        // fingerprint. Any theme change that produces a new image will yield a different
+        // CGImage, which changes the signature and forces a preview regeneration.
+        UIImage *img = nil;
+        if (layout && [icon respondsToSelector:@selector(iconImageWithInfo:)]) {
+            @try {
+                img = [icon iconImageWithInfo:layout.iconImageInfo];
+            } @catch (__unused NSException *e) {
+                img = nil;
+            }
+        }
+        if (img) {
+            CGImageRef cg = img.CGImage;
+            if (cg) {
+                [sig appendFormat:@"%p|", cg];
+            } else {
+                [sig appendFormat:@"%lu|", (unsigned long)img.hash];
+            }
+        } else {
+            [sig appendFormat:@"nil|"];
+        }
+    }
+    return sig;
+}
+
 %hook SBIconListModel
-%property (assign, nonatomic) BOOL griddyShouldPatch; 
+%property (assign, nonatomic) BOOL griddyShouldPatch;
 %property (assign, nonatomic) BOOL griddyNeedsRefreshFolderImage;
 
 //SBIconListGridCellInfo is essentially the template for laying out icons
@@ -359,11 +412,16 @@ BOOL hasLoadedPrefs = NO;
 
     if (elem == nil || gridImageRef == nil || folderIconRef == nil) return %orig;
 
-    SBIconListModel *workingModel = folderIconRef.folder.lists[elem.pageIndex];
+    // FIX (bug 2): Always use the FIRST page of the folder, not the page the user is
+    // currently viewing. Using elem.pageIndex caused previews to render the page the
+    // user was on when they moved an icon (e.g. page 2/3), instead of page 1.
+    SBFolder *folder = folderIconRef.folder;
+    SBIconListModel *firstPageModel = folder.firstList;
+    if (firstPageModel == nil) return %orig;
 
-    if (!workingModel.griddyShouldPatch) return %orig;
+    if (!firstPageModel.griddyShouldPatch) return %orig;
 
-    // checks a bunch of fodler tweaks to determine if it should patch the image
+    // checks a bunch of folder tweaks to determine if it should patch the image
     if (!patchFoldersChecked) {
         shouldPatchFolderIcon = determineFolderPatching();
         patchFoldersChecked = YES;
@@ -379,15 +437,27 @@ BOOL hasLoadedPrefs = NO;
 
     SBIconListGridLayout *miniIconLayout = (SBIconListGridLayout *)gridImageRef.listLayout;
 
-    //get image from cache or generate new one
-    SBIconGridImage *griddyImage = folderImageCache[folderIconRef.uniqueIdentifier];
+    // FIX (bug 1): cache entry now stores {image, signature}. The signature is built from
+    // the first-page icon identifiers AND each icon's current rendered image fingerprint
+    // (CGImage pointer). Any theme change that produces new icon images will change the
+    // fingerprint, so the preview regenerates on next read without depending on any
+    // system notification or a global theme version counter.
+    NSDictionary *cachedEntry = folderImageCache[folderIconRef.uniqueIdentifier];
+    SBIconGridImage *griddyImage = cachedEntry[@"image"];
+    NSString *cachedSignature = cachedEntry[@"signature"];
+    NSString *currentSignature = GriddyFolderSignature(firstPageModel, miniIconLayout);
+    BOOL signatureMatches = (cachedSignature != nil) && [cachedSignature isEqualToString:currentSignature];
 
-    if (workingModel.griddyNeedsRefreshFolderImage || griddyImage == nil || !hasLoadedPrefs) {
-        SBIconGridImage *tempImage = generateNewFolderImageForModel(workingModel, gridImageRef, imageCache, miniIconLayout);
-        if(griddyImageSuccess == YES) {
-            workingModel.griddyNeedsRefreshFolderImage = NO;
-            folderImageCache[folderIconRef.uniqueIdentifier] = tempImage;
-            griddyImage = folderImageCache[folderIconRef.uniqueIdentifier];
+    //get image from cache or generate new one
+    if (firstPageModel.griddyNeedsRefreshFolderImage || griddyImage == nil || !hasLoadedPrefs || !signatureMatches) {
+        SBIconGridImage *tempImage = generateNewFolderImageForModel(firstPageModel, gridImageRef, imageCache, miniIconLayout);
+        if (griddyImageSuccess == YES && tempImage != nil) {
+            firstPageModel.griddyNeedsRefreshFolderImage = NO;
+            folderImageCache[folderIconRef.uniqueIdentifier] = @{
+                @"image": tempImage,
+                @"signature": currentSignature
+            };
+            griddyImage = tempImage;
         }
     }
 
@@ -420,6 +490,8 @@ BOOL hasLoadedPrefs = NO;
     else
         self.model.griddyShouldPatch = NO;
 
+    // FIX (bug 3): We still observe the dock purely for orientation detection.
+    // The dock itself is no longer in patchLocations, so griddyShouldPatch stays NO for it.
     //we will only use the dock for deciding rotation
     //SBIconLocationFloatingDockSuggestions is for floating dock
     if (!([self.iconLocation isEqualToString:@"SBIconLocationDock"] || [self.iconLocation isEqualToString:@"SBIconLocationFloatingDock"])) {
@@ -467,9 +539,12 @@ BOOL hasLoadedPrefs = NO;
     portraitSavedDict = [userDefaults dictionaryForKey:@"GriddyPortraitSave"];
     landscapeSavedDict = [userDefaults dictionaryForKey:@"GriddyLandscapeSave"];
 
-
-    NSString *temp[] = {@"SBIconLocationRoot", @"SBIconLocationDock", @"SBIconLocationFolder", @"SBIconLocationRootWithWidgets", @"SBIconLocationFloatingDock"};
-    patchLocations = [NSArray arrayWithObjects:temp count:5];
+    // FIX (bug 3): Removed SBIconLocationDock and SBIconLocationFloatingDock.
+    // The dock has its own fixed layout that doesn't need Griddy's grid patching,
+    // and patching it caused conflicts. Dock is still observed in layoutIconsIfNeeded
+    // for orientation detection only.
+    NSString *temp[] = {@"SBIconLocationRoot", @"SBIconLocationFolder", @"SBIconLocationRootWithWidgets"};
+    patchLocations = [NSArray arrayWithObjects:temp count:3];
 
     folderImageCache = [[NSMutableDictionary alloc] init];
 }

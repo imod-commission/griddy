@@ -1,9 +1,9 @@
-Package: com.mikifp.griddy
+Package: com.imodcommission.griddy
 Name: Griddy
-Version: 1.0.5
+Version: 1.1
 Architecture: iphoneos-arm
-Description: Layout your icons anywhere you want!
-Maintainer: mikifp
-Author: mikifp
+Description: Layout your icons anywhere you want! Fixed issues for icon themes, folder icons, and app library.
+Maintainer: mikifp, imod_commission
+Author: mikifp, imod_commission
 Section: Tweaks
 Depends: mobilesubstrate
