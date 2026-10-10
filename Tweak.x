@@ -22,22 +22,17 @@ NSMutableDictionary<NSString *, NSDictionary *> *folderImageCache;
 BOOL griddyImageSuccess = NO;
 BOOL hasLoadedPrefs = NO;
 
-// FIX (link error): resolve SBIcon at runtime to avoid referencing _OBJC_CLASS_$_SBIcon,
-// which is not an exported symbol in SpringBoard. Original code only used `SBIcon *` as
-// a type, never the class itself, so no symbol was needed.
+// FIX (link error): resolve SBIcon at runtime to avoid referencing _OBJC_CLASS_$_SBIcon.
 static Class GriddySBIconClass(void) {
     static Class c = nil;
     if (!c) c = NSClassFromString(@"SBIcon");
     return c;
 }
 
-// FIX (crash): re-entrancy guard for gridCellInfoForGridSize:options:. Patching the icons
-// array can indirectly re-enter layout, which re-enters this method, and the second entry
-// would operate on a half-mutated array. Guard with a thread-local flag.
+// FIX (crash): re-entrancy guard for gridCellInfoForGridSize:options:
 static __thread BOOL gInGridCellPatch = NO;
 
-// FIX (crash): safe uniqueIdentifier access. nil / non-string / empty all return nil so
-// callers can skip. Prevents nil dictionary keys and stale entries.
+// FIX (crash): safe uniqueIdentifier access.
 static NSString *GriddyIconID(SBIcon *icon) {
     if (!icon) return nil;
     @try {
@@ -47,7 +42,18 @@ static NSString *GriddyIconID(SBIcon *icon) {
     return nil;
 }
 
-// FIX (crash): build a signature from cheap string lookups only (no image loading).
+// FIX (theme): drop one folder's cached preview. Safe on nil / unknown key.
+static void GriddyInvalidateFolder(NSString *folderID) {
+    if (!folderID) return;
+    @try { [folderImageCache removeObjectForKey:folderID]; } @catch (__unused NSException *e) {}
+}
+
+// FIX (theme): wipe all cached folder previews.
+static void GriddyInvalidateAllFolders(void) {
+    @try { [folderImageCache removeAllObjects]; } @catch (__unused NSException *e) {}
+}
+
+// Signature uses cheap string lookups only (no image loading).
 static NSString *GriddyFolderSignature(SBIconListModel *model) {
     if (!model) return @"";
     NSMutableString *sig = [NSMutableString string];
@@ -76,8 +82,6 @@ static NSString *GriddyFolderSignature(SBIconListModel *model) {
 %property (assign, nonatomic) BOOL griddyShouldPatch;
 %property (assign, nonatomic) BOOL griddyNeedsRefreshFolderImage;
 
-// FIX (crash): wrap the icons-array replacement so a bad return value cannot poison the
-// model. Only accept a same-length NSArray; otherwise keep the original array.
 - (SBIconListGridCellInfo *)gridCellInfoForGridSize:(SBHIconGridSize)arg1 options:(NSUInteger)arg2 {
     SBIconListGridCellInfo *info = %orig;
     if (!self.griddyShouldPatch) return info;
@@ -92,9 +96,7 @@ static NSString *GriddyFolderSignature(SBIconListModel *model) {
                 self.icons = patched;
             }
         }
-    } @catch (NSException *e) {
-        // Never let a Griddy exception take down SpringBoard.
-    }
+    } @catch (NSException *e) {}
     gInGridCellPatch = NO;
     return info;
 }
@@ -183,6 +185,26 @@ static NSString *GriddyFolderSignature(SBIconListModel *model) {
 
 
 %hook SBIconView
+
+// FIX (theme): the theme tweak (26Home etc.) calls -reloadIconImage on the icon view
+// after swapping images. For a folder icon this is exactly when we want to drop our
+// cached preview so it regenerates on next display.
+- (void)reloadIconImage {
+    %orig;
+    SBIcon *icon = nil;
+    @try { icon = self.icon; } @catch (__unused NSException *e) {}
+    NSString *uid = GriddyIconID(icon);
+    if (uid) GriddyInvalidateFolder(uid);
+}
+
+// FIX (theme): purgeCachedImages is another entry point used by theme tweaks.
+- (void)purgeCachedImages {
+    %orig;
+    SBIcon *icon = nil;
+    @try { icon = self.icon; } @catch (__unused NSException *e) {}
+    NSString *uid = GriddyIconID(icon);
+    if (uid) GriddyInvalidateFolder(uid);
+}
 
 - (void)dragInteraction:(id)arg1 sessionWillBegin:(id)arg2 {
     if (!self.icon) return %orig;
@@ -407,6 +429,70 @@ static NSString *GriddyFolderSignature(SBIconListModel *model) {
     if (![self.folderIconImageView isKindOfClass:NSClassFromString(@"SBHLibraryAdditionalItemsIndicatorIconImageView")] && gridWrapperSize.size.width != 0 && shouldPatchFolderIcon) self.frame = gridWrapperSize;
 }
 
+%end
+
+
+// FIX (theme): the folder icon image cache on SpringBoard side. When a theme tweak asks
+// SpringBoard to rebuild or drop cached images for a folder, we drop our own cache too
+// so the next -setImage: regenerates from the new icon images.
+%hook SBFolderIconImageCache
+
+- (void)rebuildImagesForFolderIcon:(id)folderIcon {
+    %orig;
+    SBIcon *icon = nil;
+    @try {
+        if ([folderIcon isKindOfClass:GriddySBIconClass()]) icon = (SBIcon *)folderIcon;
+        else if ([folderIcon respondsToSelector:@selector(folderIcon)]) icon = [folderIcon performSelector:@selector(folderIcon)];
+    } @catch (__unused NSException *e) {}
+    NSString *uid = GriddyIconID(icon);
+    if (uid) GriddyInvalidateFolder(uid);
+}
+
+- (void)informObserversOfUpdateForFolderIcon:(id)folderIcon {
+    %orig;
+    SBIcon *icon = nil;
+    @try {
+        if ([folderIcon isKindOfClass:GriddySBIconClass()]) icon = (SBIcon *)folderIcon;
+        else if ([folderIcon respondsToSelector:@selector(folderIcon)]) icon = [folderIcon performSelector:@selector(folderIcon)];
+    } @catch (__unused NSException *e) {}
+    NSString *uid = GriddyIconID(icon);
+    if (uid) GriddyInvalidateFolder(uid);
+}
+
+- (void)removeImagesForFolderIcon:(id)folderIcon {
+    %orig;
+    SBIcon *icon = nil;
+    @try {
+        if ([folderIcon isKindOfClass:GriddySBIconClass()]) icon = (SBIcon *)folderIcon;
+        else if ([folderIcon respondsToSelector:@selector(folderIcon)]) icon = [folderIcon performSelector:@selector(folderIcon)];
+    } @catch (__unused NSException *e) {}
+    NSString *uid = GriddyIconID(icon);
+    if (uid) GriddyInvalidateFolder(uid);
+}
+
+- (void)clearCache {
+    %orig;
+    GriddyInvalidateAllFolders();
+}
+
+- (void)purgeCache {
+    %orig;
+    GriddyInvalidateAllFolders();
+}
+
+%end
+
+
+// FIX (theme): generic icon image caches. Some theme tweaks clear these instead of the
+// folder cache. Clearing them means every rendered icon changed, so drop everything.
+%hook SBHIconImageCache
+- (void)clearCache { %orig; GriddyInvalidateAllFolders(); }
+- (void)purgeCache { %orig; GriddyInvalidateAllFolders(); }
+%end
+
+%hook SBUIconImageCache
+- (void)clearCache { %orig; GriddyInvalidateAllFolders(); }
+- (void)purgeCache { %orig; GriddyInvalidateAllFolders(); }
 %end
 
 %hook SBIconListView
